@@ -1,0 +1,595 @@
+---
+- name: Setup PostgreSQL Master
+  hosts: postgres_master
+  become: yes
+  vars:
+    postgres_version: 17
+    postgres_config_dir: /etc/postgresql/17/main
+    postgres_data_dir: /var/lib/postgresql/17/main
+    db_name: bot_database
+    db_user: bot_user
+    db_password: bot_password_123
+    rep_user: replicator
+    rep_password: replicator_pass
+
+  tasks:
+    - name: Update apt cache
+      apt:
+        update_cache: yes
+        cache_valid_time: 3600
+
+    - name: Completely remove PostgreSQL
+      shell: |
+        systemctl stop postgresql 2>/dev/null || true
+        pg_dropcluster --stop {{ postgres_version }} main 2>/dev/null || true
+        apt remove --purge -y postgresql postgresql-contrib 2>/dev/null || true
+        apt autoremove -y 2>/dev/null || true
+        rm -rf /etc/postgresql /var/lib/postgresql /var/log/postgresql /etc/postgresql-common
+      args:
+        executable: /bin/bash
+      register: pg_remove
+
+    - name: Install PostgreSQL fresh
+      apt:
+        name:
+          - postgresql
+          - postgresql-contrib
+        state: present
+
+    - name: Create PostgreSQL cluster
+      shell: |
+        pg_createcluster {{ postgres_version }} main
+      args:
+        executable: /bin/bash
+      register: cluster_create
+
+    - name: Start PostgreSQL cluster
+      shell: |
+        pg_ctlcluster {{ postgres_version }} main start
+      args:
+        executable: /bin/bash
+      register: cluster_start
+
+    - name: Wait for PostgreSQL to start
+      wait_for:
+        port: 5432
+        host: localhost
+        timeout: 30
+        delay: 3
+
+    - name: Update listen_addresses
+      lineinfile:
+        path: "{{ postgres_config_dir }}/postgresql.conf"
+        regexp: '^#?listen_addresses\s*='
+        line: "listen_addresses = '*'"
+        backup: yes
+
+    - name: Update wal_level
+      lineinfile:
+        path: "{{ postgres_config_dir }}/postgresql.conf"
+        regexp: '^#?wal_level\s*='
+        line: "wal_level = replica"
+        backup: yes
+
+    - name: Update max_wal_senders
+      lineinfile:
+        path: "{{ postgres_config_dir }}/postgresql.conf"
+        regexp: '^#?max_wal_senders\s*='
+        line: "max_wal_senders = 10"
+        backup: yes
+
+    - name: Update max_replication_slots
+      lineinfile:
+        path: "{{ postgres_config_dir }}/postgresql.conf"
+        regexp: '^#?max_replication_slots\s*='
+        line: "max_replication_slots = 10"
+        backup: yes
+
+    - name: Update hot_standby
+      lineinfile:
+        path: "{{ postgres_config_dir }}/postgresql.conf"
+        regexp: '^#?hot_standby\s*='
+        line: "hot_standby = on"
+        backup: yes
+
+    - name: Update wal_keep_size
+      lineinfile:
+        path: "{{ postgres_config_dir }}/postgresql.conf"
+        regexp: '^#?wal_keep_size\s*='
+        line: "wal_keep_size = 128MB"
+        backup: yes
+
+    - name: Add replication to pg_hba.conf
+      lineinfile:
+        path: "{{ postgres_config_dir }}/pg_hba.conf"
+        line: "host    replication     replicator     192.168.1.16/32         md5"
+        insertafter: EOF
+        backup: yes
+
+    - name: Add bot_user to pg_hba.conf
+      lineinfile:
+        path: "{{ postgres_config_dir }}/pg_hba.conf"
+        line: "host    all             bot_user        192.168.1.18/32         md5"
+        insertafter: EOF
+        backup: yes
+
+    - name: Restart PostgreSQL
+      shell: |
+        pg_ctlcluster {{ postgres_version }} main restart
+      args:
+        executable: /bin/bash
+      register: cluster_restart
+      ignore_errors: yes
+
+    - name: Wait for PostgreSQL after restart
+      wait_for:
+        port: 5432
+        host: localhost
+        timeout: 30
+        delay: 3
+
+    - name: Check PostgreSQL is running
+      shell: |
+        sudo -u postgres psql -c "SELECT version();"
+      register: pg_ready
+      changed_when: false
+
+    - name: Show PostgreSQL version
+      debug:
+        var: pg_ready.stdout
+
+    - name: Create replication user
+      shell: |
+        sudo -u postgres psql -c "CREATE USER {{ rep_user }} WITH REPLICATION LOGIN ENCRYPTED PASSWORD '{{ rep_password }}';" 2>/dev/null || \
+        sudo -u postgres psql -c "ALTER USER {{ rep_user }} WITH REPLICATION LOGIN ENCRYPTED PASSWORD '{{ rep_password }}';"
+      register: rep_user_created
+      changed_when: "'CREATE ROLE' in rep_user_created.stdout or 'ALTER ROLE' in rep_user_created.stdout"
+
+    - name: Create application user
+      shell: |
+        sudo -u postgres psql -c "CREATE USER {{ db_user }} WITH CREATEDB LOGIN ENCRYPTED PASSWORD '{{ db_password }}';" 2>/dev/null || \
+        sudo -u postgres psql -c "ALTER USER {{ db_user }} WITH CREATEDB LOGIN ENCRYPTED PASSWORD '{{ db_password }}';"
+      register: db_user_created
+      changed_when: "'CREATE ROLE' in db_user_created.stdout or 'ALTER ROLE' in db_user_created.stdout"
+
+    - name: Create application database
+      shell: |
+        sudo -u postgres psql -c "CREATE DATABASE {{ db_name }} OWNER {{ db_user }} ENCODING 'UTF8' TEMPLATE template0;" 2>/dev/null || \
+        echo "Database already exists"
+      register: db_created
+      changed_when: "'CREATE DATABASE' in db_created.stdout"
+
+    - name: Grant privileges
+      shell: |
+        sudo -u postgres psql -c "GRANT ALL PRIVILEGES ON DATABASE {{ db_name }} TO {{ db_user }};"
+
+    - name: Grant schema permissions to bot_user
+      shell: |
+        sudo -u postgres psql -d {{ db_name }} -c "GRANT USAGE ON SCHEMA public TO {{ db_user }};"
+        sudo -u postgres psql -d {{ db_name }} -c "GRANT SELECT ON ALL TABLES IN SCHEMA public TO {{ db_user }};"
+        sudo -u postgres psql -d {{ db_name }} -c "ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT SELECT ON TABLES TO {{ db_user }};"
+
+    - name: Create test tables with data
+      shell: |
+        sudo -u postgres psql -d {{ db_name }} -c "
+        CREATE TABLE IF NOT EXISTS messages (
+            id SERIAL PRIMARY KEY,
+            text TEXT,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        );
+        CREATE TABLE IF NOT EXISTS replication_logs (
+            id SERIAL PRIMARY KEY,
+            timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            action TEXT,
+            details TEXT
+        );
+        INSERT INTO messages (text) VALUES
+            ('Hello from PostgreSQL Master!'),
+            ('Replication is working!'),
+            ('Test data for lab work');
+        INSERT INTO replication_logs (action, details) VALUES
+            ('INIT', 'Replication logs table created'),
+            ('TEST', 'Test data inserted');
+        "
+      register: tables_created
+      changed_when: "'CREATE TABLE' in tables_created.stdout"
+
+    - name: Verify tables exist
+      shell: |
+        sudo -u postgres psql -d {{ db_name }} -c "\dt"
+      register: tables_verify
+      changed_when: false
+
+    - name: Show tables
+      debug:
+        var: tables_verify.stdout_lines
+
+    - name: Show PostgreSQL status
+      shell: |
+        sudo -u postgres psql -c "\du"
+        sudo -u postgres psql -c "\l"
+      register: pg_check
+      changed_when: false
+
+    - name: Show status
+      debug:
+        var: pg_check.stdout_lines
+
+- name: Setup PostgreSQL Replica
+  hosts: postgres_replica
+  become: yes
+  vars:
+    postgres_version: 17
+    postgres_data_dir: /var/lib/postgresql/17/main
+
+  tasks:
+    - name: Update apt cache
+      apt:
+        update_cache: yes
+        cache_valid_time: 3600
+
+    - name: Completely remove PostgreSQL on replica
+      shell: |
+        systemctl stop postgresql 2>/dev/null || true
+        pg_dropcluster --stop {{ postgres_version }} main 2>/dev/null || true
+        apt remove --purge -y postgresql postgresql-contrib 2>/dev/null || true
+        apt autoremove -y 2>/dev/null || true
+        rm -rf /etc/postgresql /var/lib/postgresql /var/log/postgresql /etc/postgresql-common
+      args:
+        executable: /bin/bash
+
+    - name: Install PostgreSQL fresh on replica
+      apt:
+        name:
+          - postgresql
+          - postgresql-contrib
+        state: present
+
+    - name: Copy pgbass script
+      copy:
+        src: pgbass
+        dest: /tmp/pgbass
+        mode: 0755
+
+    - name: Run pg_basebackup and configure replica
+      command: /tmp/pgbass
+      register: backup_result
+      changed_when: "'pg_basebackup' in backup_result.stdout"
+
+    - name: Show backup output
+      debug:
+        var: backup_result.stdout_lines
+
+    - name: Start PostgreSQL on replica
+      shell: |
+        pg_ctlcluster {{ postgres_version }} main start
+      args:
+        executable: /bin/bash
+      ignore_errors: yes
+
+    - name: Wait for PostgreSQL on replica
+      wait_for:
+        port: 5432
+        host: localhost
+        timeout: 60
+        delay: 5
+
+    - name: Check if replica is in recovery
+      shell: |
+        sudo -u postgres psql -t -c "SELECT pg_is_in_recovery();" | tr -d ' '
+      register: recovery_check
+      ignore_errors: yes
+
+    - name: Verify replica status
+      debug:
+        msg: "Replica is in recovery mode: {{ recovery_check.stdout }}"
+      when: recovery_check is success
+
+- name: Setup Telegram Bot
+  hosts: telegram_bot
+  become: yes
+  vars:
+    bot_dir: /opt/telegram_bot
+    repo_url: https://github.com/nimd4/devops_bot.git
+    venv_dir: "{{ bot_dir }}/venv"
+    env_file: "{{ bot_dir }}/.env"
+    service_name: telegram_bot
+    db_host: 192.168.1.15
+    db_port: "5432"
+    db_name: bot_database
+    db_user: bot_user
+    db_password: bot_password_123
+    bot_token: "8678000796:AAEmOqstafVh1ByU7bGAR1oW-AzQpxtQeAY"
+
+  tasks:
+    - name: Update apt cache
+      apt:
+        update_cache: yes
+        cache_valid_time: 3600
+
+    - name: Install required packages
+      apt:
+        name:
+          - git
+          - python3
+          - python3-venv
+          - python3-pip
+          - acl
+          - postgresql-client
+        state: present
+
+    - name: Ensure bot directory exists
+      file:
+        path: "{{ bot_dir }}"
+        state: directory
+        owner: nimda
+        group: nimda
+        mode: 0755
+
+    - name: Clone or update repository
+      git:
+        repo: "{{ repo_url }}"
+        dest: "{{ bot_dir }}"
+        force: yes
+        update: yes
+      become_user: nimda
+      register: git_clone
+
+    - name: Show git status
+      debug:
+        msg: "Repository cloned/updated: {{ git_clone.changed }}"
+
+    - name: Create virtual environment
+      command: python3 -m venv {{ venv_dir }}
+      args:
+        creates: "{{ venv_dir }}/bin/python"
+      become_user: nimda
+
+    - name: Install Python dependencies
+      pip:
+        name:
+          - python-telegram-bot
+          - psycopg2-binary
+        virtualenv: "{{ venv_dir }}"
+        virtualenv_command: python3 -m venv
+      become_user: nimda
+
+    - name: Create config.py file
+      copy:
+        dest: "{{ bot_dir }}/config.py"
+        content: |
+          BOT_TOKEN = "8678000796:AAEmOqstafVh1ByU7bGAR1oW-AzQpxtQeAY"
+          DB_HOST = "192.168.1.15"
+          DB_PORT = "5432"
+          DB_NAME = "bot_database"
+          DB_USER = "bot_user"
+          DB_PASSWORD = "bot_password_123"
+        owner: nimda
+        group: nimda
+        mode: 0644
+
+    - name: Create bot.py file
+      copy:
+        dest: "{{ bot_dir }}/bot.py"
+        content: |
+          import logging
+          import psycopg2
+          from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+          from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes
+          import config
+
+          logging.basicConfig(
+              format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+              level=logging.INFO
+          )
+          logger = logging.getLogger(__name__)
+
+          def get_db_connection():
+              return psycopg2.connect(
+                  host=config.DB_HOST,
+                  port=config.DB_PORT,
+                  database=config.DB_NAME,
+                  user=config.DB_USER,
+                  password=config.DB_PASSWORD
+              )
+
+          async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+              keyboard = [
+                  [InlineKeyboardButton("Показать данные", callback_data='show_data')],
+                  [InlineKeyboardButton("Показать логи репликации", callback_data='show_logs')]
+              ]
+              reply_markup = InlineKeyboardMarkup(keyboard)
+              await update.message.reply_text(
+                  "Привет\n"
+                  "Выберите действие:",
+                  reply_markup=reply_markup
+              )
+
+          async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+              query = update.callback_query
+              await query.answer()
+
+              if query.data == 'show_data':
+                  try:
+                      conn = get_db_connection()
+                      cur = conn.cursor()
+                      cur.execute("SELECT table_name FROM information_schema.tables WHERE table_schema='public';")
+                      tables = cur.fetchall()
+
+                      if tables:
+                          result = "Список таблиц в БД:\n"
+                          for table in tables:
+                              result += f"  - {table[0]}\n"
+                      else:
+                          result = "В базе данных нет таблиц."
+
+                      cur.close()
+                      conn.close()
+                      await query.edit_message_text(result)
+
+                  except Exception as e:
+                      await query.edit_message_text(f"Ошибка при получении данных: {str(e)}")
+
+              elif query.data == 'show_logs':
+                  try:
+                      conn = get_db_connection()
+                      cur = conn.cursor()
+
+                      cur.execute("""
+                          SELECT EXISTS (
+                              SELECT 1 FROM information_schema.tables
+                              WHERE table_name = 'replication_logs'
+                          );
+                      """)
+                      has_logs_table = cur.fetchone()[0]
+
+                      if has_logs_table:
+                          cur.execute("""
+                              SELECT timestamp, action, details
+                              FROM replication_logs
+                              ORDER BY timestamp DESC
+                              LIMIT 10;
+                          """)
+                          logs = cur.fetchall()
+
+                          if logs:
+                              result = "Последние логи репликации:\n\n"
+                              for log in logs:
+                                  result += f"  - {log[0]}\n"
+                                  result += f"    {log[1]}\n"
+                                  result += f"    {log[2]}\n"
+                                  result += "\n"
+                          else:
+                              result = "Логи репликации отсутствуют."
+                      else:
+                          result = "Таблица для логов репликации не найдена."
+
+                      cur.close()
+                      conn.close()
+                      await query.edit_message_text(result)
+
+                  except Exception as e:
+                      await query.edit_message_text(f"Ошибка при получении логов: {str(e)}")
+
+          def main():
+              application = Application.builder().token(config.BOT_TOKEN).build()
+              application.add_handler(CommandHandler("start", start))
+              application.add_handler(CallbackQueryHandler(button_callback))
+              application.run_polling(allowed_updates=Update.ALL_TYPES)
+
+          if __name__ == '__main__':
+              main()
+        owner: nimda
+        group: nimda
+        mode: 0644
+
+    - name: Create .env file
+      copy:
+        dest: "{{ env_file }}"
+        content: |
+          BOT_TOKEN=8678000796:AAEmOqstafVh1ByU7bGAR1oW-AzQpxtQeAY
+          DB_HOST=192.168.1.15
+          DB_PORT=5432
+          DB_NAME=bot_database
+          DB_USER=bot_user
+          DB_PASSWORD=bot_password_123
+        owner: nimda
+        group: nimda
+        mode: 0600
+
+    - name: Create systemd service file
+      copy:
+        dest: /etc/systemd/system/{{ service_name }}.service
+        content: |
+          [Unit]
+          Description=Telegram Bot Service
+          After=network.target postgresql.service
+          Wants=postgresql.service
+
+          [Service]
+          Type=simple
+          User=nimda
+          Group=nimda
+          WorkingDirectory={{ bot_dir }}
+          Environment="PATH={{ venv_dir }}/bin:/usr/local/bin:/usr/bin:/bin"
+          ExecStart={{ venv_dir }}/bin/python {{ bot_dir }}/bot.py
+          Restart=on-failure
+          RestartSec=10
+          StandardOutput=journal
+          StandardError=journal
+
+          [Install]
+          WantedBy=multi-user.target
+        mode: 0644
+
+    - name: Reload systemd
+      systemd:
+        daemon_reload: yes
+
+    - name: Enable and start bot service
+      systemd:
+        name: "{{ service_name }}"
+        enabled: yes
+        state: started
+      register: service_start
+
+    - name: Check bot service status
+      systemd:
+        name: "{{ service_name }}"
+      register: service_status
+
+    - name: Show service status
+      debug:
+        var: service_status.status
+
+- name: Final verification
+  hosts: all
+  become: yes
+  tasks:
+    - name: Show PostgreSQL version
+      command: psql --version
+      register: pg_version
+      changed_when: false
+      ignore_errors: yes
+
+    - name: Display PostgreSQL version
+      debug:
+        msg: "{{ inventory_hostname }}: {{ pg_version.stdout }}"
+      when: pg_version is success
+
+    - name: Check PostgreSQL service status
+      systemd:
+        name: postgresql
+      register: pg_service
+      ignore_errors: yes
+
+    - name: Display PostgreSQL service status
+      debug:
+        msg: "{{ inventory_hostname }} PostgreSQL: {{ pg_service.status.ActiveState }}"
+      when: pg_service is success
+
+    - name: Check bot service status
+      systemd:
+        name: telegram_bot
+      register: bot_service
+      ignore_errors: yes
+
+    - name: Display bot service status
+      debug:
+        msg: "{{ inventory_hostname }} Bot: {{ bot_service.status.ActiveState }}"
+      when: bot_service is success and inventory_hostname == 'vm3'
+
+- name: Verify replication on master
+  hosts: postgres_master
+  become: yes
+  tasks:
+    - name: Check replication status
+      shell: |
+        sudo -u postgres psql -c "SELECT usename, application_name, client_addr, state, sync_state FROM pg_stat_replication;"
+      register: rep_final_status
+      ignore_errors: yes
+
+    - name: Show replication status
+      debug:
+        var: rep_final_status.stdout_lines
+      when: rep_final_status is success
