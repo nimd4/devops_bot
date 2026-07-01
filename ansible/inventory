@@ -1,12 +1,12 @@
 [postgres_master]
-vm1 ansible_host=192.168.1.15
+vm1 ansible_host=192.168.1.15 ansible_user=nimda ansible_ssh_pass=8
 
 [postgres_replica]
-vm2 ansible_host=192.168.1.16
+vm2 ansible_host=192.168.1.16 ansible_user=nimda ansible_ssh_pass=8
 
 [telegram_bot]
-vm3 ansible_host=192.168.1.18
+vm3 ansible_host=192.168.1.18 ansible_user=nimda ansible_ssh_pass=8
 
 [all:vars]
-ansible_user=nimda
 ansible_python_interpreter=/usr/bin/python3
+host_key_checking=False
